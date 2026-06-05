@@ -513,30 +513,69 @@ class MoERunner(MoERunnerInterface):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
-        if self._quant_method.is_monolithic:
-            fused_out = self._quant_method.apply_monolithic(
-                layer=layer,
-                x=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
-        else:
-            topk_weights, topk_ids = self.router.select_experts(
+        topk_weights, topk_ids = self.router.select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 input_ids=input_ids,
             )
-
-            # Passing shared_experts_input in case SharedExpertsOrder is
-            # MK_INTERNAL_OVERLAPPED.
-            fused_out = self._quant_method.apply(
-                layer=layer,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
+        local_topk_ids = layer.global_to_local_expert_ids(topk_ids) if layer.use_ep else topk_ids
+ 
+        if self._quant_method.is_monolithic:
+            if layer.is_gpu_resident_layer:
+                fused_out = self._quant_method.apply_monolithic(
+                    layer=layer,
+                    x=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
+            elif torch.cuda.is_current_stream_capturing():
+                fused_out = layer._cpu_decode(
+                    hidden_states,
+                    topk_weights, 
+                    local_topk_ids, 
+                )
+            elif layer.is_gpu_prefill_layer and layer.should_use_gpu_prefill(hidden_states):   
+                fused_out = layer._gpu_prefill(
+                    hidden_states,
+                    topk_weights, 
+                    local_topk_ids,
+                )
+            else:
+                fused_out = layer._cpu_prefill(
+                    hidden_states,
+                    topk_weights, 
+                    local_topk_ids,
+                )
+                  
+        else:
+            if layer.is_gpu_resident_layer:
+                fused_out = self._quant_method.apply(
+                    layer=layer,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
+            elif torch.cuda.is_current_stream_capturing():
+                fused_out = layer._cpu_decode(
+                    hidden_states,
+                    topk_weights, 
+                    local_topk_ids, 
+                )
+            elif layer.is_gpu_prefill_layer and layer.should_use_gpu_prefill(hidden_states):   
+                fused_out = layer._gpu_prefill(
+                    hidden_states,
+                    topk_weights, 
+                    local_topk_ids,
+                )
+            else:
+                fused_out = layer._cpu_prefill(
+                    hidden_states,
+                    topk_weights, 
+                    local_topk_ids,
+                )
+                
 
         self._maybe_apply_shared_experts(
             shared_experts_input,

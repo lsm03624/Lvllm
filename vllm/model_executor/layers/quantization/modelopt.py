@@ -1433,6 +1433,12 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.platforms import current_platform
+        device = torch.cuda.current_device() if current_platform.is_cuda_alike() else "cpu"
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            device = "cpu"
+            
         assert self.quant_config.is_checkpoint_nvfp4_serialized
 
         layer.num_experts = num_experts
@@ -1451,6 +1457,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
                 dtype=weight_dtype,
+                device=device,
             ),
             input_dim=1,
             output_dim=2,
@@ -1466,6 +1473,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // 2,
                 dtype=weight_dtype,
+                device=device,
             ),
             input_dim=1,
             output_dim=2,
@@ -1480,6 +1488,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
+                device=device,
             ),
             input_dim=1,
             output_dim=2,
@@ -1494,6 +1503,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
+                device=device,
             ),
             input_dim=1,
             output_dim=2,
@@ -1506,13 +1516,13 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         )
 
         w13_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(num_experts, w13_num_shards, dtype=torch.float32),
+            data=torch.empty(num_experts, w13_num_shards, dtype=torch.float32, device=device),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
 
         w2_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(num_experts, dtype=torch.float32),
+            data=torch.empty(num_experts, dtype=torch.float32, device=device),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
@@ -1541,6 +1551,9 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            return
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
