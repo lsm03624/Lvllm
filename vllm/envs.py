@@ -233,8 +233,6 @@ if TYPE_CHECKING:
     LVLLM_MOE_NUMA_ENABLED: bool = False
     LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD: bool = False
     LVLLM_ENABLE_NUMA_INTERLEAVE: bool = False
-    LVLLM_MOE_QUANT_ON_GPU: bool = False
-    LVLLM_MOE_USE_WEIGHT: Literal["KEEP", "INT4"] = "KEEP"
     LVLLM_GPU_RESIDENT_MOE_LAYERS: str | None = None
     LVLLM_GPU_PREFILL_MIN_BATCH_SIZE: int = 0
     LVLLM_GPU_PREFETCH_WINDOW: int = 1
@@ -1668,11 +1666,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LVLLM_ENABLE_NUMA_INTERLEAVE": lambda: bool(
         int(os.getenv("LVLLM_ENABLE_NUMA_INTERLEAVE", "0"))
     ),
-    "LVLLM_MOE_QUANT_ON_GPU": lambda: bool(
-        int(os.getenv("LVLLM_MOE_QUANT_ON_GPU", "0"))
-    ),
-    # Weight format for MOE.
-    "LVLLM_MOE_USE_WEIGHT": lambda: os.getenv("LVLLM_MOE_USE_WEIGHT", "INT4"),
     "LVLLM_GPU_RESIDENT_MOE_LAYERS": lambda: os.environ.get("LVLLM_GPU_RESIDENT_MOE_LAYERS", None),
     # Whether to enable GPU expert computation.
     "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE": lambda: int(
@@ -1920,11 +1913,9 @@ def compile_factors() -> dict[str, object]:
         "LVLLM_MOE_NUMA_ENABLED",
         "LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD",
         "LVLLM_GPU_RESIDENT_MOE_LAYERS",
-        "LVLLM_MOE_USE_WEIGHT",
         "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE",
         "LVLLM_GPU_PREFETCH_WINDOW",
         "LVLLM_ENABLE_NUMA_INTERLEAVE",
-        "LVLLM_MOE_QUANT_ON_GPU",
     }
 
     from vllm.config.utils import normalize_value
@@ -1972,25 +1963,14 @@ def compile_factors() -> dict[str, object]:
         factors[var] = normalize_value(os.getenv(var))
 
     return factors
- 
-from enum import Enum
-class MoeComputeStrategy(str, Enum):
-        KEEP = "KEEP"             
-        INT4 = "INT4" 
+  
         
 def is_lk_moe_feature_enabled() -> bool:
-    try:
-        import  lk_moe  
-        return environment_variables["LVLLM_MOE_NUMA_ENABLED"]()
-    except Exception as e:
-        print(f"Error: lk_moe is not available falling back to default behavior." , e)
-        return False
+    return environment_variables["LVLLM_MOE_NUMA_ENABLED"]()
 
 def is_numa_interleave_enabled() -> bool:
     return environment_variables["LVLLM_ENABLE_NUMA_INTERLEAVE"]()
-def is_lk_moe_quant_on_gpu() -> bool:
-    return environment_variables["LVLLM_MOE_QUANT_ON_GPU"]()
-
+ 
 def is_lk_moe_use_gpu_prefill() -> bool:
     return environment_variables["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"]() > 0
 
@@ -2015,25 +1995,7 @@ def set_profile_run(status: bool):
 def get_gpu_prefill_min_batch_size() -> int:
     return environment_variables["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"]() 
 
-
-def get_moe_compute_strategy() -> MoeComputeStrategy: 
-    strategy = environment_variables["LVLLM_MOE_USE_WEIGHT"]()
-    
-    try:
-        strategy_upper = strategy.upper() 
-        if strategy_upper == "TO_DTYPE":
-            print("Warning: TO_DTYPE is no longer supported for FP8 models, falling back to INT4")
-            return MoeComputeStrategy.INT4 
-        elif strategy_upper == "KEEP":
-            # print("Warning: KEEP strategy is currently not supported for FP8 models, falling back to INT4")
-            return MoeComputeStrategy.KEEP
-        elif strategy_upper == "INT4": 
-            return MoeComputeStrategy.INT4
-        return MoeComputeStrategy(strategy_upper)
-    except ValueError: 
-        print(f"Warning: Invalid LVLLM_MOE_USE_WEIGHT value '{strategy}', using 'INT4'")
-        return MoeComputeStrategy.INT4
-      
+ 
 
 def get_gpu_prefetch_window() -> int:
     return environment_variables["LVLLM_GPU_PREFETCH_WINDOW"]()
@@ -2122,37 +2084,7 @@ def is_lk_moe_gpu_resident_layer(layer_name: str) -> bool:
 def enabled_layerwise_load() -> bool:
     return environment_variables["LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD"]() 
 
-
-import threading
-from contextlib import contextmanager
-
-class LkMoeSerialGuard:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._owner = None
-        self._depth = 0
-    
-    @contextmanager
-    def acquire(self):
-        thread_id = threading.get_ident()
-         
-        if self._owner == thread_id:
-            self._depth += 1
-            try:
-                yield
-            finally:
-                self._depth -= 1
-            return
-         
-        with self._lock:
-            self._owner = thread_id
-            self._depth = 1
-            try:
-                yield
-            finally:
-                self._owner = None
-                self._depth = 0
-                
+      
 import torch
 
 def check_tensor_stats(tensor, name, threshold=1e6):

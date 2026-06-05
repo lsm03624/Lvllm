@@ -24,4 +24,4 @@ fastsafetensors >= 0.2.2
 nvidia-cutlass-dsl>=4.4.2
 quack-kernels>=0.3.3
 
-lk_moe==1.8.4
+lk_moe==2.0.0

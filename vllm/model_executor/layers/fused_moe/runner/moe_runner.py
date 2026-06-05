@@ -44,11 +44,8 @@ from vllm.utils.torch_utils import (
 )
 
 from vllm.logger import init_logger
-from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.envs import is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_lk_moe_quant_on_gpu
 logger = init_logger(__name__)
 import threading
-_gpu_prefill_lock = threading.Lock()
 
 def get_layer_from_name(layer_name: str) -> torch.nn.Module:
     forward_context: ForwardContext = get_forward_context()
@@ -100,43 +97,14 @@ def _moe_forward(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
 ) -> torch.Tensor:
-    forward_context: ForwardContext = get_forward_context()
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
-    layer_name = layer.layer_name
-    if layer.should_use_gpu_prefill(hidden_states):
-        if _gpu_prefill_lock.acquire(blocking=False):
-            try:
-                moe_prefetch(layer, layer_name, hidden_states, forward_context, 1)
-                moe_wait_prefetch(layer, hidden_states, forward_context)
-                fused_output = layer.runner._forward_impl(
-                    layer,
-                    hidden_states,
-                    router_logits,
-                    shared_experts_input,
-                    input_ids,
-                )
-                moe_cleanup(layer, layer_name, hidden_states, forward_context)
-                return fused_output
-            finally:
-                _gpu_prefill_lock.release()
-        else:
-            logger.debug("GPU prefill busy, fallback to normal path")
-            return layer.runner._forward_impl(
-                    layer,
-                    hidden_states,
-                    router_logits,
-                    shared_experts_input,
-                    input_ids,
-                )
-    else: 
-        return layer.runner._forward_impl(
-                layer,
-                hidden_states,
-                router_logits,
-                shared_experts_input,
-                input_ids,
-            )
-    return fused_output
+    return layer.runner._forward_impl(
+        layer,
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+    )
 
 
 def _moe_forward_fake(
@@ -156,45 +124,14 @@ def _moe_forward_shared(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    forward_context: ForwardContext = get_forward_context()
-    layer = get_layer_from_name(_resolve_layer_name(layer_name)) 
-    layer_name = layer.layer_name
-    if layer.should_use_gpu_prefill(hidden_states): 
-        if _gpu_prefill_lock.acquire(blocking=False):
-            try:
-                moe_prefetch(layer, layer_name, hidden_states, forward_context, 1)
-                moe_wait_prefetch(layer, hidden_states, forward_context)
-                shared_out, fused_out = layer.runner._forward_impl(
-                    layer,
-                    hidden_states,
-                    router_logits,
-                    shared_experts_input,
-                    input_ids,
-                )
-                moe_cleanup(layer, layer_name, hidden_states, forward_context)
-            finally:
-                _gpu_prefill_lock.release()
-        else:
-            logger.debug("GPU prefill busy, fallback to normal path")
-            layer.ensure_moe_quant_config_init()
-            shared_out, fused_out = layer.runner._forward_impl(
-                    layer,
-                    hidden_states,
-                    router_logits,
-                    shared_experts_input,
-                    input_ids,
-                )
-        
-    else:
-        layer.ensure_moe_quant_config_init()
-        shared_out, fused_out = layer.runner._forward_impl(
-                    layer,
-                    hidden_states,
-                    router_logits,
-                    shared_experts_input,
-                    input_ids,
-                )
-    return shared_out, fused_out
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    return layer.runner._forward_impl(
+        layer,
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+    )
 
 
 def _moe_forward_shared_fake(
@@ -523,66 +460,61 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
         local_topk_ids = layer.global_to_local_expert_ids(topk_ids) if layer.use_ep else topk_ids
-
+ 
         if self.quant_method.is_monolithic:
-            if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
-                fused_out = layer.forward_lk( 
-                    hidden_states,
-                    topk_weights, 
-                    local_topk_ids
-                )
-            else:
-                from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
-                from vllm.model_executor.layers.quantization.gguf import _fused_moe_gguf
-                if layer.is_gpu_prefill_layer and not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
-                    fused_out = torch.ops.vllm._fused_moe_gguf(
-                        hidden_states,
-                        layer.w13_weight.data,
-                        layer.w2_weight.data,
-                        topk_weights,
-                        local_topk_ids,
-                        2,
-                        2,
-                        layer.activation.value,
-                    )
-                else:
-                    fused_out = self.quant_method.apply_monolithic(
+            if layer.is_gpu_resident_layer:
+                fused_out = self.quant_method.apply_monolithic(
                     layer=layer,
                     x=hidden_states,
                     router_logits=router_logits,
                     input_ids=input_ids,
                 )
-        else:
-            if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
-                fused_out = layer.forward_lk(
+            elif torch.cuda.is_current_stream_capturing():
+                fused_out = layer._cpu_decode(
                     hidden_states,
                     topk_weights, 
-                    local_topk_ids
+                    local_topk_ids, 
+                )
+            elif layer.is_gpu_prefill_layer and layer.should_use_gpu_prefill(hidden_states):   
+                fused_out = layer._gpu_prefill(
+                    hidden_states,
+                    topk_weights, 
+                    local_topk_ids,
                 )
             else:
-                from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod  
-                from vllm.model_executor.layers.quantization.gguf import _fused_moe_gguf
-                if layer.is_gpu_prefill_layer and not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
-                    fused_out = torch.ops.vllm._fused_moe_gguf(
-                        hidden_states,
-                        layer.w13_weight.data,
-                        layer.w2_weight.data,
-                        topk_weights,
-                        local_topk_ids,
-                        2,
-                        2,
-                        layer.activation.value,
-                    )
-                else:
-                    # Passing shared_experts_input in case SharedExpertsOrder is
-                    # MK_INTERNAL_OVERLAPPED.
-                    fused_out = self.quant_method.apply(
-                        layer=layer,
-                        x=hidden_states,
-                        topk_weights=topk_weights,
-                        topk_ids=topk_ids,
-                        shared_experts_input=shared_experts_input,
-                    )
+                fused_out = layer._cpu_prefill(
+                    hidden_states,
+                    topk_weights, 
+                    local_topk_ids,
+                )
+                  
+        else:
+            if layer.is_gpu_resident_layer:
+                fused_out = self.quant_method.apply(
+                    layer=layer,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts_input=shared_experts_input,
+                )
+            elif torch.cuda.is_current_stream_capturing():
+                fused_out = layer._cpu_decode(
+                    hidden_states,
+                    topk_weights, 
+                    local_topk_ids, 
+                )
+            elif layer.is_gpu_prefill_layer and layer.should_use_gpu_prefill(hidden_states):   
+                fused_out = layer._gpu_prefill(
+                    hidden_states,
+                    topk_weights, 
+                    local_topk_ids,
+                )
+            else:
+                fused_out = layer._cpu_prefill(
+                    hidden_states,
+                    topk_weights, 
+                    local_topk_ids,
+                )
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
@@ -840,380 +772,3 @@ class MoERunner(MoERunnerInterface):
                 shared_output,
                 hidden_states,
             )
-
-
-from vllm.envs import extract_layer_index    
-
-from typing import Dict, Optional, List 
- 
-
-def create_cpu_weights(layer, is_fp8: bool, is_wna16: bool, is_regular: bool) -> Dict[str, torch.Tensor]: 
-    pin_memory = is_pin_memory_available()
-    cpu_weights = {}
-    
-    if is_fp8 or is_wna16: 
-        param_names = ["w13_weight", "w2_weight"]
-        for param_name in param_names:
-            if param_name == "w13_weight":
-                E = layer.local_num_experts
-                N = layer.intermediate_size_per_partition * 2 if layer.has_gate_proj else layer.intermediate_size_per_partition
-                K = layer.hidden_size
-                shape = (E, N, K * 18 // 32)
-            elif param_name == "w2_weight":
-                E = layer.local_num_experts
-                N = layer.hidden_size
-                K = layer.intermediate_size_per_partition
-                shape = (E, N, K * 18 // 32)
-            
-            weight_cpu = torch.zeros(
-                shape,
-                dtype=torch.uint8,
-                device="cpu",
-                requires_grad=False,
-                pin_memory=pin_memory
-            ).contiguous()
-            
-        
-            cpu_weights[param_name] = weight_cpu
-            logger.debug(f"Created {param_name} with shape {shape} for FP8/WNA16 layer")
-            
-    elif is_regular: 
-        w13_shape = (layer.local_num_experts, 
-                    layer.intermediate_size_per_partition * 2 if layer.has_gate_proj else layer.intermediate_size_per_partition,    
-                    layer.hidden_size)
-        w13_buffer_size = w13_shape[0] * w13_shape[1] * w13_shape[2] * 2 
-
-        w13_weight_cpu = torch.zeros(
-            w13_buffer_size,
-            dtype=torch.uint8,
-            device="cpu",
-            requires_grad=False,
-            pin_memory=pin_memory,
-        ).contiguous() 
-        
-        
-        cpu_weights['w13_weight'] = w13_weight_cpu
-        logger.debug(f"Created w13_weight with shape {w13_shape} for regular layer")
-            
-        w2_shape = (layer.local_num_experts,
-                    layer.hidden_size,
-                    layer.intermediate_size_per_partition)
-        w2_buffer_size = w2_shape[0] * w2_shape[1] * w2_shape[2] * 2
-        w2_weight_cpu = torch.zeros(
-            w2_buffer_size,
-            dtype=torch.uint8,
-            device="cpu",
-            requires_grad=False,
-            pin_memory=pin_memory,
-        ).contiguous() 
-        
-        cpu_weights['w2_weight'] = w2_weight_cpu
-        logger.debug(f"Created w2_weight with shape {w2_shape} for regular layer")
-    
-    return cpu_weights
- 
-def moe_prepare_gpu_prefill(layer, forward_context: ForwardContext, device: torch.device):
-    
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE   
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16_marlin import CompressedTensorsWNA16MarlinMoEMethod
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import CompressedTensorsWNA16MoEMethod  
-    from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod  
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8 import CompressedTensorsW8A8Fp8MoEMethod
-    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
-    if layer.is_gpu_prefill_layer: 
-        batch_key = id(forward_context.batch_descriptor)
-        logger.debug(f"batch_key={batch_key}, forward_context={id(forward_context)}")
-        batch_id = getattr(forward_context, '_prefetch_batch_id', None)
-        is_temporary = False
-         
-        if batch_id is not None:
-            stored_batch_key = getattr(forward_context, '_prefetch_batch_key', None)
-            if stored_batch_key != batch_key:
-                logger.warning(f"Batch key mismatch! stored={stored_batch_key}, current={batch_key}, "
-                       f"resetting batch_id from {batch_id} to None")
-                batch_id = None
-        
-        if batch_id is None:
-            with FusedMoE._batch_lock: 
-                batch_id = getattr(forward_context, '_prefetch_batch_id', None)
-                if batch_id is not None:
-                    stored_batch_key = getattr(forward_context, '_prefetch_batch_key', None)
-                    if stored_batch_key != batch_key:
-                        batch_id = None
-                
-                if batch_id is None:
-                    for bid, in_use in FusedMoE._batch_usage.items():
-                        if not in_use:
-                            batch_id = bid
-                            FusedMoE._batch_usage[bid] = True
-                            forward_context._prefetch_batch_id = batch_id
-                            forward_context._prefetch_batch_key = batch_key  
-                            break
-                    
-                    if batch_id is None:
-                        batch_id = -1  
-                        is_temporary = True
-                        forward_context._prefetch_batch_id = batch_id
-                        forward_context._prefetch_batch_key = batch_key 
-         
-        with torch.no_grad():
-
-            batch_key = id(forward_context.batch_descriptor)
-
-            prefetch_stream = forward_context._prefetch_streams[batch_key]
-            prefetch_events = forward_context._prefetch_events
-        
-            with torch.cuda.stream(prefetch_stream):
-                
-                param_names = [
-                    "w13_weight",
-                    "w2_weight", 
-                ] 
-                
-                if is_temporary:
-                    cpu_weights = create_cpu_weights(layer)
-                else:
-                    cpu_weights = {}
-                 
-                for param_name in param_names:
-                    if is_temporary:
-                        weight_cpu = cpu_weights[param_name].contiguous()
-                        weight_gpu = torch.zeros_like(weight_cpu, device=device, memory_format=torch.contiguous_format)
-                    else:
-                        weight_cpu = FusedMoE._cpu_weights_placeholder[batch_id][param_name].contiguous()
-                        weight_gpu = FusedMoE._gpu_weights_placeholder[batch_id][param_name].contiguous()
-                     
-                    
-                    is_fp8 =  isinstance(layer.quant_method, Fp8MoEMethod) or isinstance(layer.quant_method, CompressedTensorsW8A8Fp8MoEMethod)
-                    is_wna16 = (isinstance(layer.quant_method, CompressedTensorsWNA16MarlinMoEMethod) or isinstance(layer.quant_method, CompressedTensorsWNA16MoEMethod))
-                    is_regular = isinstance(layer.quant_method, UnquantizedFusedMoEMethod)
-                    if is_fp8 or is_wna16:
-                        if param_name == "w13_weight":
-                            E = layer.local_num_experts
-                            N = layer.intermediate_size_per_partition * 2 if layer.has_gate_proj else layer.intermediate_size_per_partition
-                            K = layer.hidden_size
-                            shape = (E, N, K * 18 // 32)
-                        elif param_name == "w2_weight":
-                            E = layer.local_num_experts
-                            N = layer.hidden_size
-                            K = layer.intermediate_size_per_partition
-                            shape = (E, N, K * 18 // 32) 
-                        
-                        total_elements = shape[0] * shape[1] * shape[2]
-                        weight_buffer = weight_cpu[:total_elements].reshape(shape)
-                        weight_buffer_gpu = weight_gpu.view(torch.uint8)[:total_elements].reshape(shape)
-                        layer.lk_moe.collectWeight(
-                            param_name,
-                            weight_buffer.data_ptr()
-                        ) 
-                    elif is_regular:
-                        if param_name == "w13_weight":
-                            E = layer.local_num_experts
-                            N = layer.intermediate_size_per_partition * 2 if layer.has_gate_proj else layer.intermediate_size_per_partition
-                            K = layer.hidden_size
-                            shape = (E, N, K)
-                        elif param_name == "w2_weight":
-                            E = layer.local_num_experts
-                            N = layer.hidden_size
-                            K = layer.intermediate_size_per_partition
-                            shape = (E, N, K)
-                        weight_buffer = weight_cpu.view(layer.moe_config.in_dtype).reshape(shape)
-                        weight_buffer_gpu = weight_gpu.view(layer.moe_config.in_dtype).reshape(shape)
-                        if param_name == "w13_weight":
-                            if layer.has_gate_proj:
-                                layer.lk_moe.collect_weights(
-                                    True,  
-                                    0,
-                                    0,
-                                    weight_buffer.data_ptr(),  
-                                    0  # 0   gate  
-                                )
-                                
-                                layer.lk_moe.collect_weights(
-                                    True,  
-                                    0,
-                                    0,
-                                    weight_buffer.data_ptr(),  
-                                    1  # 1   up
-                                )
-                            else:
-                                layer.lk_moe.collect_weights(
-                                    True,  
-                                    0,
-                                    0,
-                                    weight_buffer.data_ptr(),  
-                                    1  # 1   up
-                                )
-                        elif param_name == "w2_weight":
-                            layer.lk_moe.collect_weights(
-                                True,  
-                                0,
-                                0,
-                                weight_buffer.data_ptr(),  
-                                2  # w2
-                            )
-                        else:
-                            raise ValueError(f"Unsupported param_name {param_name} for layer")
-                    weight_buffer_gpu.copy_(weight_buffer, non_blocking=True)
-                    weight_buffer_gpu.record_stream(prefetch_stream) 
-                    setattr(layer, param_name, torch.nn.Parameter(weight_buffer_gpu, requires_grad=False))
-                
-                layer_id = id(layer)
-                event = torch.cuda.Event()
-                event.record(prefetch_stream)
-                batch_key = id(forward_context.batch_descriptor)
-                prefetch_events[(layer_id, batch_key)] = event
-
-        
-def moe_clean_gpu_prefill(layer, forward_context: ForwardContext):   
-    with torch.no_grad():   
-        param_names = ["w13_weight", "w2_weight"]
-        
-        for param_name in param_names:
-            if hasattr(layer, param_name):
-                setattr(layer, param_name, None)
-       
-        if hasattr(forward_context, '_prefetch_batch_id'):
-            from vllm.model_executor.layers.fused_moe.layer import FusedMoE  
-            with FusedMoE._batch_lock:
-                batch_id = forward_context._prefetch_batch_id
-                if batch_id >= 0:
-                    FusedMoE._batch_usage[batch_id] = False
-            
-            delattr(forward_context, '_prefetch_batch_id')
-            if hasattr(forward_context, '_prefetch_batch_key'):
-                delattr(forward_context, '_prefetch_batch_key')
-  
-
-def moe_cleanup(layer, layer_name: str, hidden_states: torch.Tensor, forward_context: ForwardContext): 
-    
-    if not layer.should_use_gpu_prefill(hidden_states):
-        return
-    
-    
-    layer_idx = extract_layer_index(layer_name)
-    batch_key = id(forward_context.batch_descriptor)
-     
-    if not hasattr(forward_context, '_batch_prefetch_states'):
-        return
-    if batch_key not in forward_context._batch_prefetch_states:
-        return
-    
-    batch_state = forward_context._batch_prefetch_states[batch_key]
-    state = batch_state['state']
-     
-    keys_to_clean = [k for k in state.keys() if k <= layer_idx]
-    
-    for k in keys_to_clean: 
-        candidate_name = layer_name.replace(f".{layer_idx}.", f".{k}.")
-        if is_lk_moe_gpu_resident_layer(candidate_name):
-            del state[k]
-            continue  
-        layer_obj = forward_context.no_compile_layers.get(candidate_name)
-        if layer_obj:
-            if hasattr(forward_context, '_prefetch_events'):
-                layer_id = id(layer_obj)
-                batch_key = id(forward_context.batch_descriptor)
-                key = (layer_id, batch_key)
-                if key in forward_context._prefetch_events:
-                    forward_context._prefetch_events[key].wait()
-                    del forward_context._prefetch_events[key]
-            moe_clean_gpu_prefill(layer_obj, forward_context)
-        del state[k]
-
-def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor, 
-                 forward_context: ForwardContext, gpu_prefetch_window: int): 
-    
-    if not layer.should_use_gpu_prefill(hidden_states):
-        return
-    
-    if not hasattr(forward_context, '_prefetch_streams'):
-        forward_context._prefetch_streams = {}
-        
-    if not hasattr(forward_context, '_prefetch_events'):
-        forward_context._prefetch_events = {}  
-        
-    if not hasattr(forward_context, '_batch_prefetch_states'):
-        forward_context._batch_prefetch_states = {}
-    
-    layer_idx = extract_layer_index(layer_name)
-    batch_key = id(forward_context.batch_descriptor) 
-    
-    if batch_key not in forward_context._prefetch_streams:
-        forward_context._prefetch_streams[batch_key] = torch.cuda.Stream()
-     
-    if batch_key not in forward_context._batch_prefetch_states:
-        forward_context._batch_prefetch_states[batch_key] = {
-            'state': {},  # layer_idx -> prefetch_count
-            'called_layers': set()
-        }
-    
-    batch_state = forward_context._batch_prefetch_states[batch_key]
-    state = batch_state['state']
-    called_layers = batch_state['called_layers']
-     
-    if layer_idx == 0:
-        state.clear()
-        called_layers.clear()
-     
-    if layer_name in called_layers:
-        return
-    
-    called_layers.add(layer_name)  
-            
-    active_prefetches = 0
-    for k in state.keys():
-        candidate_name = layer_name.replace(f".{layer_idx}.", f".{k}.")
-        if not is_lk_moe_gpu_resident_layer(candidate_name):
-            active_prefetches += 1
-     
-    available_slots = gpu_prefetch_window - active_prefetches
-    
-    layer_count = len(forward_context.no_compile_layers)
-    if available_slots > 0: 
-        prefetch_candidates = [] 
-        for offset in range(0, layer_count): 
-            candidate_idx = layer_idx + offset
-            candidate_name = layer_name.replace(f".{layer_idx}.", f".{candidate_idx}.")
-            
-            if candidate_name not in forward_context.no_compile_layers:
-                break  
-             
-            if is_lk_moe_gpu_resident_layer(candidate_name):
-                continue
-             
-            if candidate_idx not in state and len(prefetch_candidates) < available_slots:
-                candidate_layer = forward_context.no_compile_layers.get(candidate_name)
-                if candidate_layer:
-                    prefetch_candidates.append((candidate_idx, candidate_layer))
-         
-        for idx, layer_obj in prefetch_candidates:
-            moe_prepare_gpu_prefill(layer_obj, forward_context, torch.cuda.current_device())
-            state[idx] = 1
-               
-    
-                    
-def moe_wait_prefetch(layer, hidden_states: torch.Tensor, forward_context: ForwardContext):
- 
-    if not hasattr(forward_context, '_prefetch_events'):
-        return
-    
-    if not layer.should_use_gpu_prefill(hidden_states):
-        return
-    
-    layer_id = id(layer)
-    batch_key = id(forward_context.batch_descriptor)
-    prefetch_events = forward_context._prefetch_events
-    key = (layer_id, batch_key)
-    
-    if key in prefetch_events:
-        prefetch_events[key].wait()
-        del prefetch_events[key] 
-    current_stream = torch.cuda.current_stream() 
-    if hasattr(layer, 'w13_weight') and layer.w13_weight is not None:
-        layer.w13_weight.record_stream(current_stream)
-    if hasattr(layer, 'w2_weight') and layer.w2_weight is not None:
-        layer.w2_weight.record_stream(current_stream)
-        
-    if not torch.cuda.is_current_stream_capturing():
-        torch.cuda.current_stream().synchronize()
