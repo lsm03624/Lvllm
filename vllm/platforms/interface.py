@@ -86,6 +86,9 @@ class DeviceCapability(NamedTuple):
             return NotImplemented
         return (self.major, self.minor) > (other.major, other.minor)
 
+    def __hash__(self) -> int:
+        return hash((self.major, self.minor))
+
     def as_version_str(self) -> str:
         return f"{self.major}.{self.minor}"
 
@@ -168,6 +171,10 @@ class Platform:
 
     def is_cpu(self) -> bool:
         return self._enum == PlatformEnum.CPU
+
+    def uses_host_device_handling(self) -> bool:
+        """Whether vLLM should leave DeviceConfig.device unset."""
+        return self.is_tpu()
 
     def is_zen_cpu(self) -> bool:
         return False
@@ -1008,6 +1015,13 @@ class Platform:
 
         # Native always used by default. Platforms can override this behavior.
         return IrOpPriorityConfig.with_default(["native"])
+
+    @classmethod
+    def is_arch_support_pdl(cls) -> bool:
+        """
+        Does the current platform support PDL (Programmatic Dependent Launch)?
+        """
+        return False
 
 
 class UnspecifiedPlatform(Platform):

@@ -15,7 +15,11 @@ from typing_extensions import assert_never
 import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
-from vllm.model_executor.layers.attention import Attention, MLAAttention
+from vllm.model_executor.layers.attention import (
+    Attention,
+    MLAAttention,
+    MMEncoderAttention,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -28,7 +32,6 @@ from vllm.model_executor.models.interfaces import SupportsQuant
 from vllm.tracing import instrument
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 
 logger = init_logger(__name__)
 
@@ -97,8 +100,6 @@ def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
     for _, module in model.named_modules():
-        if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
-            module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
             # When quant methods need to process weights after loading
@@ -108,16 +109,13 @@ def process_weights_after_loading(
             # parameters onto device for processing and back off after.
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
-        if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
-            module.clean_weights_after_loading() 
-            setattr(module, "process_lk_moe_already_called", True)
 
-    # Initialize post-load attention weights for both Attention and MLA.
+    # Initialize post-load attention weights for Attention, MLA, and MM encoder.
     # NOTE: Happens after other modules so we can easily decompress weights.
     for _, module in model.named_modules():
-        if isinstance(module, (Attention, MLAAttention)) and hasattr(
-            module, "process_weights_after_loading"
-        ):
+        if isinstance(
+            module, (Attention, MLAAttention, MMEncoderAttention)
+        ) and hasattr(module, "process_weights_after_loading"):
             # TODO(lucas): see if there is a way to unify the signatures
             # of process_weights_after_loading
             with device_loading_context(module, target_device):
@@ -131,9 +129,6 @@ def process_weights_after_loading(
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
-    if isinstance(module, FusedMoE) and not module.is_gpu_resident_layer: 
-        yield module
-        return
     if target_device.type == "cpu":
         # If target is CPU, no need to move anything
         yield module
@@ -155,8 +150,6 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         yield module
 
     finally:
-        if isinstance(module, FusedMoE) and not module.is_gpu_resident_layer:  
-            return
         use_pin_memory = (
             is_pin_memory_available()
             and not envs.VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY

@@ -13,14 +13,15 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
+    RoutedExperts,
+    SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
     int4_w4a16_moe_quant_config,
 )
-from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
+from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
     BatchedMarlinExperts,
     MarlinExperts,
     fused_marlin_moe,
@@ -166,10 +167,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        from vllm.platforms import current_platform
-        device = torch.cuda.current_device() if current_platform.is_cuda_alike() else "cpu"
-        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
-            device = "cpu" 
         intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
 
         # Will transpose the loaded weight along the
@@ -189,7 +186,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                     intermediate_size_per_partition,
                 ),
                 dtype=torch.int32,
-                device=device,
             ),
             requires_grad=False,
         )
@@ -205,7 +201,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                     intermediate_size_per_partition,
                 ),
                 dtype=torch.int32,
-                device=device,
             ),
             requires_grad=False,
         )
@@ -243,7 +238,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                     num_groups_w13=num_groups_w13,
                 ),
                 dtype=params_dtype,
-                device=device,
             ),
             requires_grad=False,
         )
@@ -260,7 +254,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                     num_groups_w2=num_groups_w2,
                 ),
                 dtype=params_dtype,
-                device=device,
             ),
             requires_grad=False,
         )
@@ -285,7 +278,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 num_experts,
                 hidden_size,
                 dtype=torch.int32,
-                device=device,
             ),
             requires_grad=False,
         )
@@ -297,7 +289,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 num_experts,
                 intermediate_size_per_partition,
                 dtype=torch.int32,
-                device=device,
             ),
             requires_grad=False,
         )
@@ -309,7 +300,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 num_experts,
                 hidden_size,
                 dtype=torch.int32,
-                device=device,
             ),
             requires_grad=False,
         )
@@ -321,7 +311,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 num_experts,
                 intermediate_size_per_partition,
                 dtype=torch.int32,
-                device=device,
             ),
             requires_grad=False,
         )
@@ -333,8 +322,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         layer.marlin_state = GPTQMarlinState.REPACK
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
-            return
         num_experts = layer.w13_weight_g_idx.shape[0]
         device = layer.w13_weight_g_idx.device
         if self.kernel_backend == "Flashinfer":
@@ -528,7 +515,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
     def apply_monolithic(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
@@ -554,10 +541,11 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
     def apply(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.kernel_backend == "Marlin"

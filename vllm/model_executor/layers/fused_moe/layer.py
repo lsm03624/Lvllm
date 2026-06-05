@@ -3,13 +3,13 @@
 
 from collections.abc import Callable, Iterable
 from enum import Enum
-from typing import Literal, cast, get_args, overload
+from typing import Literal, cast, overload
 
 import torch
 from torch.nn.parameter import UninitializedParameter
 
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
     get_dp_group,
@@ -26,14 +26,14 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.fused_moe.expert_map_manager import (
+    ExpertMapManager,
+)
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
-)
-from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
-    init_aiter_topK_meta_data,
 )
 from vllm.model_executor.layers.fused_moe.router.router_factory import (
     create_fused_moe_router,
@@ -59,167 +59,13 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
- 
-from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.envs import is_lk_moe_feature_enabled, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_in_profile_run
 
-if is_lk_moe_feature_enabled():
-    import  lk_moe  
-    logger.info("lk_moe module is available, lk::MOE implementation will be used")
-else:
-    logger.error("Failed to import lk_moe module or LVLLM_MOE_NUMA_ENABLED is not set to 1, lk::MOE implementation will not be available")
 
 class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
     CHANNEL = "channel"
     GROUP = "group"
     BLOCK = "block"
-
-
-def determine_expert_map(
-    ep_size: int,
-    ep_rank: int,
-    global_num_experts: int,
-    expert_placement_strategy: ExpertPlacementStrategy = "linear",
-    num_fused_shared_experts: int = 0,
-    return_expert_mask: bool = False,
-) -> tuple[int, torch.Tensor | None, torch.Tensor | None]:
-    """
-    Calculates how many experts should be assigned to each rank for EP and
-    creates a mapping from global to local expert index. Experts are
-    distributed evenly across ranks. Any remaining are assigned to the
-    last rank.
-
-    Args:
-        ep_size: The size of the expert parallel group
-        ep_rank: The rank of the current process in the expert parallel
-            group
-        global_num_experts: The total number of experts in the model.
-        expert_placement_strategy: The expert placement strategy.
-
-    Returns:
-        tuple[int, Optional[torch.Tensor]]: A tuple containing:
-            - local_num_experts (int): The number of experts assigned
-                to the current rank.
-            - expert_map (Optional[torch.Tensor]): A tensor of shape
-                (global_num_experts,) mapping from global to local index.
-                Contains -1 for experts not assigned to the current rank.
-                Returns None if ep_size is 1.
-            - expert_mask (Optional[torch.Tensor]): A tensor of shape
-                (global_num_experts + num_fused_shared_experts + 1,)
-                containing 1 for experts assigned to the current rank
-                and 0 for sentinel.
-                Returns None if ep_size is 1.
-                Used only when AITER MOE is enabled.
-    """
-    assert ep_size > 0
-    if ep_size == 1:
-        return (global_num_experts, None, None)
-
-    # Distribute experts as evenly as possible to each rank.
-    base_experts = global_num_experts // ep_size
-    remainder = global_num_experts % ep_size
-    local_num_experts = base_experts + 1 if ep_rank < remainder else base_experts
-
-    # Create a tensor of size num_experts filled with -1
-    expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32)
-    # Create an expert map for the local experts
-    if expert_placement_strategy == "linear":
-        start_idx = ep_rank * base_experts + min(ep_rank, remainder)
-        expert_map[start_idx : start_idx + local_num_experts] = torch.arange(
-            0, local_num_experts, dtype=torch.int32
-        )
-    elif expert_placement_strategy == "round_robin":
-        local_log_experts = torch.arange(
-            ep_rank, global_num_experts, ep_size, dtype=torch.int32
-        )
-
-        expert_map[local_log_experts] = torch.arange(
-            0, local_num_experts, dtype=torch.int32
-        )
-    else:
-        raise ValueError(
-            "Unsupported expert placement strategy "
-            f"'{expert_placement_strategy}', expected one of "
-            f"{get_args(ExpertPlacementStrategy)}"
-        )
-
-    expert_mask = None
-    if return_expert_mask:
-        expert_mask = torch.ones(
-            (global_num_experts + num_fused_shared_experts + 1,), dtype=torch.int32
-        )
-        expert_mask[-1] = 0
-        expert_mask[:global_num_experts] = expert_map > -1
-        expert_map = torch.cat(
-            (
-                expert_map,
-                torch.tensor(
-                    [local_num_experts + i for i in range(num_fused_shared_experts)],
-                    dtype=torch.int32,
-                ),
-            ),
-            dim=0,
-        )
-
-    return (local_num_experts, expert_map, expert_mask)
-
-
-def determine_expert_placement_strategy(
-    expert_placement_strategy: ExpertPlacementStrategy,
-    moe_parallel_config: FusedMoEParallelConfig,
-    num_expert_group: int | None,
-    num_redundant_experts: int,
-    enable_eplb: bool,
-) -> ExpertPlacementStrategy:
-    if expert_placement_strategy == "round_robin":
-        round_robin_supported = (
-            (num_expert_group is not None and num_expert_group > 1)
-            and num_redundant_experts == 0
-            and not enable_eplb
-        )
-
-        if not round_robin_supported:
-            logger.warning(
-                "Round-robin expert placement is only supported for "
-                "models with multiple expert groups and no redundant "
-                "experts. Falling back to linear expert placement."
-            )
-            return "linear"
-        if (
-            moe_parallel_config.use_all2all_kernels
-            and not moe_parallel_config.needs_round_robin_routing_tables
-        ):
-            logger.warning(
-                "Round-robin expert placement currently only supports "
-                "the DeepEP low-latency or NIXL EP backend, but '%s' was configured. "
-                "Falling back to linear expert placement.",
-                moe_parallel_config.all2all_backend,
-            )
-            return "linear"
-
-    return expert_placement_strategy
-
-
-def get_compressed_expert_map(expert_map: torch.Tensor) -> str:
-    """
-    Compresses the expert map by removing any -1 entries.
-
-    Args:
-        expert_map (torch.Tensor): A tensor of shape (global_num_experts,)
-            mapping from global to local index. Contains -1 for experts not
-            assigned to the current rank.
-
-    Returns:
-        str: A string mapping from local to global index.
-            Using str to support hashing for logging once only.
-    """
-    global_indices = torch.where(expert_map != -1)[0]
-    local_indices = expert_map[global_indices]
-    return ", ".join(
-        f"{local_index.item()}->{global_index.item()}"
-        for local_index, global_index in zip(local_indices, global_indices)
-    )
 
 
 # --8<-- [start:fused_moe]
@@ -290,6 +136,7 @@ class FusedMoE(PluggableLayer):
         router_logits_dtype: torch.dtype | None = None,
         gate: torch.nn.Module | None = None,
         shared_experts: torch.nn.Module | None = None,
+        shared_expert_gate: torch.nn.Module | None = None,
         routed_input_transform: torch.nn.Module | None = None,
         routed_output_transform: torch.nn.Module | None = None,
         apply_routed_scale_to_output: bool = False,
@@ -305,18 +152,6 @@ class FusedMoE(PluggableLayer):
         vllm_config = get_current_vllm_config()
         self.vllm_config = vllm_config
         self.swiglu_limit = swiglu_limit
-        
-        if vllm_config.model_config is not None:
-            self.check_nan_in_output = (vllm_config.model_config.architecture in ["MiniMaxM2ForCausalLM", "Step3p5ForCausalLM"])
-        else:
-            self.check_nan_in_output = False
-        
-        if vllm_config.model_config is not None:
-            self.has_gate_proj  = not (vllm_config.model_config.architecture == "NemotronHForCausalLM")
-        else:
-            self.has_gate_proj = True
-            
-        self.expert_cache_size = 96
 
         # FIXME (varun): We should have a better way of inferring the activation
         # datatype. This works for now as the tensor datatype entering the MoE
@@ -360,25 +195,24 @@ class FusedMoE(PluggableLayer):
         compilation_config.static_forward_context[prefix] = self
         compilation_config.static_all_moe_layers.append(prefix)
         self.layer_name = prefix
-        
-        self.is_gpu_resident_layer = is_lk_moe_gpu_resident_layer(self.layer_name) 
-        self.is_gpu_prefill_layer = is_lk_moe_gpu_prefill_layer(self.layer_name)
-        self.is_cpu_layer = is_lk_moe_cpu_layer(self.layer_name)
-        if get_gpu_prefill_min_batch_size() > vllm_config.scheduler_config.max_num_batched_tokens:
-            logger.error(
-                f"gpu_prefill_min_batch_size ({get_gpu_prefill_min_batch_size()}) "
-                f"must be less than or equal to max_num_batched_tokens "
-                f"({vllm_config.scheduler_config.max_num_batched_tokens})"
-            )
-        self.max_num_group_batch_size = self.get_max_num_group_batch_size()
-        self.max_num_batched_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
 
-        self.enable_eplb = enable_eplb
-        # TODO(bnell): should this be owned by router?
-        self.eplb_state = EplbLayerState()
         self.expert_placement_strategy: ExpertPlacementStrategy = (
             vllm_config.parallel_config.expert_placement_strategy
         )
+
+        self.eplb_state: EplbLayerState | None = None
+        if enable_eplb:
+            if self.use_ep and self.global_num_experts % self.ep_size != 0:
+                raise ValueError(
+                    f"EPLB currently only supports even distribution of "
+                    f"experts across ranks. Got {self.global_num_experts} experts "
+                    f"and {self.ep_size} EP ranks."
+                )
+            self.eplb_state = EplbLayerState()
+        else:
+            assert not self.use_ep or num_redundant_experts == 0, (
+                "Redundant experts are only supported with EPLB."
+            )
 
         # ROCm aiter shared experts fusion
         # AITER only supports gated activations (silu/gelu), so disable it
@@ -395,6 +229,8 @@ class FusedMoE(PluggableLayer):
             if n_shared_experts is not None and self.aiter_fmoe_shared_expert_enabled
             else 0
         )
+        self.shared_expert_gate = shared_expert_gate
+
         if (
             not self.aiter_fmoe_shared_expert_enabled
             and self.num_fused_shared_experts != 0
@@ -405,66 +241,27 @@ class FusedMoE(PluggableLayer):
             )
 
         # Determine expert maps
-        if self.use_ep:
-            if self.enable_eplb:
-                assert self.global_num_experts % self.ep_size == 0, (
-                    "EPLB currently only supports even distribution of "
-                    "experts across ranks."
-                )
-            else:
-                assert num_redundant_experts == 0, (
-                    "Redundant experts are only supported with EPLB."
-                )
+        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
-            self.expert_placement_strategy = determine_expert_placement_strategy(
-                expert_placement_strategy=self.expert_placement_strategy,
-                moe_parallel_config=self.moe_parallel_config,
-                num_expert_group=num_expert_group,
-                num_redundant_experts=num_redundant_experts,
-                enable_eplb=self.enable_eplb,
-            )
+        # Create ExpertMapManager to handle expert mapping and placement for EP.
+        # See ExpertMapManager for a detailed description of what it does and when
+        # it is required.
+        self.expert_map_manager = ExpertMapManager(
+            max_num_batched_tokens=max_num_batched_tokens,
+            top_k=top_k,
+            global_num_experts=self.global_num_experts,
+            num_redundant_experts=num_redundant_experts,
+            num_expert_group=num_expert_group,
+            moe_parallel_config=self.moe_parallel_config,
+            placement_strategy=self.expert_placement_strategy,
+            enable_eplb=enable_eplb,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+            rocm_aiter_enabled=self.rocm_aiter_fmoe_enabled,
+        )
 
-            self._expert_map: torch.Tensor | None
-            local_num_experts, expert_map, expert_mask = determine_expert_map(
-                ep_size=self.ep_size,
-                ep_rank=self.ep_rank,
-                global_num_experts=self.global_num_experts,
-                expert_placement_strategy=self.expert_placement_strategy,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                return_expert_mask=self.rocm_aiter_fmoe_enabled,
-            )
-            self.local_num_experts = local_num_experts
-            self.register_buffer("_expert_map", expert_map)
-            self.register_buffer("expert_mask", expert_mask)
-            self._maybe_init_expert_routing_tables()
-            logger.info_once(
-                "[EP Rank %s/%s] Expert parallelism is enabled. Expert "
-                "placement strategy: %s. Local/global"
-                " number of experts: %s/%s. Experts local to global index map:"
-                " %s.",
-                self.ep_rank,
-                self.ep_size,
-                self.expert_placement_strategy,
-                self.local_num_experts,
-                self.global_num_experts,
-                get_compressed_expert_map(self._expert_map),
-            )
-        else:
-            self.local_num_experts, self._expert_map, self.expert_mask = (
-                self.global_num_experts,
-                None,
-                None,
-            )
+        self.update_expert_map_info()
 
         self.top_k = top_k
-
-        self._init_aiter_shared_experts_topK_buffer(
-            vllm_config=vllm_config, dp_size=dp_size_
-        )
-        if self.use_ep and self.rocm_aiter_fmoe_enabled:
-            assert self.expert_mask is None or torch.all(
-                (expert_mask == 0) | (expert_mask == 1)
-            ), "Aiter Fused MoE kernel only supports expert_map with 0 and 1s."
 
         assert intermediate_size % self.tp_size == 0
         intermediate_size_per_partition = intermediate_size // self.tp_size
@@ -509,7 +306,6 @@ class FusedMoE(PluggableLayer):
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             num_fused_shared_experts=self.num_fused_shared_experts,
-            enable_eplb=enable_eplb,
             # TODO(bnell): once we can construct the MK at init time, we
             # can make this a value.
             indices_type_getter=lambda: self.quant_method.topk_indices_dtype,
@@ -532,13 +328,14 @@ class FusedMoE(PluggableLayer):
             in_dtype=moe_in_dtype,
             moe_backend=vllm_config.kernel_config.moe_backend,
             router_logits_dtype=router_logits_dtype,
-            max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
+            max_num_tokens=max_num_batched_tokens,
             has_bias=has_bias,
             is_act_and_mul=is_act_and_mul,
             is_lora_enabled=vllm_config.lora_config is not None,
             activation=self.activation,
             device=vllm_config.device_config.device,
             routing_method=self.routing_method_type,
+            swiglu_limit=swiglu_limit,
             # TODO: in_dtype == out_dtype?
             disable_inplace=disable_inplace() or shared_experts is not None,
         )
@@ -570,12 +367,14 @@ class FusedMoE(PluggableLayer):
         # for heuristic purposes, so it must be initialized first.
         self.quant_method: FusedMoEMethodBase = _get_quant_method()
 
-        if not self.moe_config.is_act_and_mul and not current_platform.is_cuda_alike():
+        if not self.moe_config.is_act_and_mul and not (
+            current_platform.is_cuda_alike() or current_platform.is_xpu()
+        ):
             raise NotImplementedError(
-                "is_act_and_mul=False is supported only for CUDA and ROCm for now"
+                "is_act_and_mul=False is supported only for CUDA and XPU for now"
             )
 
-        if self.enable_eplb and not self.quant_method.supports_eplb:
+        if enable_eplb and not self.quant_method.supports_eplb:
             # TODO: Add support for additional quantization methods.
             # The implementation for other quantization methods does not
             # contain essential differences, but the current quant API
@@ -611,7 +410,7 @@ class FusedMoE(PluggableLayer):
         }
         # need full intermediate size pre-sharding for WNA16 act order
         if self.quant_method.__class__.__name__ in (
-            "GPTQMarlinMoEMethod",
+            "AutoGPTQMoEMethod",
             "CompressedTensorsWNA16MarlinMoEMethod",
             "CompressedTensorsWNA16MoEMethod",
         ):
@@ -631,6 +430,7 @@ class FusedMoE(PluggableLayer):
             router=self.router,
             gate=gate,
             shared_experts=shared_experts,
+            shared_expert_gate=self.shared_expert_gate,
             quant_method=self.quant_method,
             enable_dbo=self.vllm_config.parallel_config.enable_dbo,
             routed_input_transform=routed_input_transform,
@@ -661,11 +461,8 @@ class FusedMoE(PluggableLayer):
             return None
 
         self.ensure_moe_quant_config_init()
-        # routing_tables only needed for round-robin expert placement with
-        # DeepEP all2all backend.
-        routing_tables = self._maybe_init_expert_routing_tables()
         prepare_finalize = self.base_quant_method.maybe_make_prepare_finalize(
-            routing_tables=routing_tables
+            routing_tables=self._expert_routing_tables()
         )
         if prepare_finalize is not None:
             logger.debug(
@@ -676,7 +473,6 @@ class FusedMoE(PluggableLayer):
                     self,
                     self.base_quant_method,
                     prepare_finalize,
-                    self.shared_experts,
                     inplace=not self.moe_config.disable_inplace,
                 )
             )
@@ -717,16 +513,26 @@ class FusedMoE(PluggableLayer):
         # By default, router/gate is called before FusedMoE forward pass
         return self.runner.is_internal_router()
 
-    def _maybe_init_expert_routing_tables(
+    def update_expert_map_info(self):
+        # Update local attributes from ExpertMapManager
+        self.local_num_experts = self.expert_map_manager.local_num_experts
+        self.expert_placement_strategy = self.expert_map_manager.placement_strategy
+        self.register_buffer("_expert_map", self.expert_map_manager.expert_map)
+        self.register_buffer("expert_mask", self.expert_map_manager.expert_mask)
+
+        # Get routing tables from ExpertMapManager
+        routing_tables = self.expert_map_manager.routing_tables
+        if routing_tables is not None:
+            # Register routing tables as buffers for this layer
+            global_to_physical, physical_to_global, local_global = routing_tables
+            self.register_buffer("expert_global_to_physical", global_to_physical)
+            self.register_buffer("expert_physical_to_global", physical_to_global)
+            self.register_buffer("expert_local_to_global", local_global)
+
+    def _expert_routing_tables(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        # Currently routing_tables only needed for round-robin expert placement
-        # with DeepEP-ll or NIXL EP all2all backends.
-        if self.expert_placement_strategy != "round_robin" or (
-            not self.moe_parallel_config.needs_round_robin_routing_tables
-        ):
-            return None
-
+        # Return cached routing tables if already registered as buffers
         if hasattr(self, "expert_global_to_physical"):
             return cast(
                 tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -736,85 +542,21 @@ class FusedMoE(PluggableLayer):
                     self.expert_local_to_global,
                 ),
             )
-
-        if self._expert_map is None:
-            return None
-
-        routing_tables = self.ensure_round_robin_expert_routing_tables(
-            global_num_experts=self.global_num_experts,
-            ep_size=self.ep_size,
-            ep_rank=self.ep_rank,
-            local_num_experts=self.local_num_experts,
-            device=self._expert_map.device,
-        )
-
-        global_to_physical, physical_to_global, local_global = routing_tables
-        self.register_buffer("expert_global_to_physical", global_to_physical)
-        self.register_buffer("expert_physical_to_global", physical_to_global)
-        self.register_buffer("expert_local_to_global", local_global)
-
-        return routing_tables
-
-    @staticmethod
-    def ensure_round_robin_expert_routing_tables(
-        global_num_experts: int,
-        ep_size: int,
-        ep_rank: int,
-        local_num_experts: int,
-        device: torch.device | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        device_kwargs = {"device": device} if device is not None else {}
-        global_indices = torch.arange(
-            global_num_experts, dtype=torch.long, **device_kwargs
-        )
-        owner = torch.remainder(global_indices, ep_size)
-        local_index = torch.div(global_indices, ep_size, rounding_mode="floor")
-        base = global_num_experts // ep_size
-        remainder = global_num_experts % ep_size
-        physical_offset = owner * base
-        if remainder > 0:
-            remainder_tensor = torch.tensor(
-                remainder, dtype=torch.long, **device_kwargs
-            )
-            physical_offset = physical_offset + torch.minimum(owner, remainder_tensor)
-
-        global_to_physical = physical_offset + local_index
-        physical_to_global = torch.empty_like(global_to_physical)
-        physical_to_global[global_to_physical] = global_indices
-
-        local_global = torch.arange(
-            ep_rank,
-            global_num_experts,
-            ep_size,
-            dtype=torch.long,
-            **device_kwargs,
-        )
-        if local_global.numel() != local_num_experts:
-            local_global = local_global[:local_num_experts]
-
-        return (global_to_physical, physical_to_global, local_global)
+        return None
 
     def update_expert_map(self):
-        # ep_size and ep_rank should already be updated
-        assert self._expert_map is not None
-        with self._expert_map.device:
-            local_num_experts, expert_map, expert_mask = determine_expert_map(
-                ep_size=self.ep_size,
-                ep_rank=self.ep_rank,
-                global_num_experts=self.global_num_experts,
-                expert_placement_strategy=self.expert_placement_strategy,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                return_expert_mask=self.rocm_aiter_fmoe_enabled,
-            )
-            self.local_num_experts = local_num_experts
-            self.register_buffer("_expert_map", expert_map)
-            self.register_buffer("expert_mask", expert_mask)
-            self._maybe_init_expert_routing_tables()
-            if self.aiter_fmoe_shared_expert_enabled:
-                self._init_aiter_shared_experts_topK_buffer(
-                    vllm_config=get_current_vllm_config(),
-                    dp_size=get_dp_group().world_size,
-                )
+        # Update ExpertMapManager with new EP configuration
+        # The moe_parallel_config (including ep_size and ep_rank)
+        # should already be updated.
+        # Note: ExpertMapManager.update() recalculates expert maps and
+        # reinitializes routing tables internally.
+        self.expert_map_manager.update(
+            self.moe_parallel_config,
+            global_num_experts=self.global_num_experts,
+        )
+
+        # Update local attributes from ExpertMapManager
+        self.update_expert_map_info()
 
     def _load_per_tensor_weight_scale(
         self,
@@ -1082,26 +824,7 @@ class FusedMoE(PluggableLayer):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
-        if self._expert_map is None:
-            return expert_id
-        return self._expert_map[expert_id].item()
-
-    def _init_aiter_shared_experts_topK_buffer(
-        self, vllm_config: VllmConfig, dp_size: int
-    ):
-        if self.num_fused_shared_experts > 0:
-            init_aiter_topK_meta_data(
-                n_routed_experts=self.global_num_experts,
-                n_shared_experts=self.num_fused_shared_experts,
-                top_k=self.top_k,
-                tp_rank=self.ep_rank if self.use_ep else self.tp_rank,
-                tp_size=self.ep_size if self.use_ep else self.tp_size,
-                shared_experts_score=1.0,
-                max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens
-                * dp_size,
-                is_EP=self.use_ep,
-            )
-        self.local_num_experts += self.num_fused_shared_experts
+        return self.expert_map_manager.map_global_to_local(expert_id)
 
     @overload
     def weight_loader(
@@ -1135,9 +858,6 @@ class FusedMoE(PluggableLayer):
         return_success: bool = False,
     ) -> bool | None:
         quant_config_name = self.quant_config and self.quant_config.get_name()
-        if quant_config_name == "humming":
-            assert hasattr(self.quant_method, "weight_schema")
-            quant_config_name = self.quant_method.weight_schema.quant_method
         if quant_config_name == "gpt_oss_mxfp4":
             # (FIXME) for gpt-oss all experts are combined
             if "bias" in weight_name:
@@ -1519,15 +1239,19 @@ class FusedMoE(PluggableLayer):
             "w2_input_scale",
         }
 
+        # Parameters of non-expert submodules that live inside runner (MoERunner).
+        # These must be excluded from EPLB weight rearrangement.
+        NON_EXPERT_PREFIXES = (
+            "runner._shared_experts.",
+            "runner.gate.",
+            "runner.routed_input_transform.",
+            "runner.routed_output_transform.",
+        )
+
         assert all(
             weight.is_contiguous()
             for name, weight in weights
-            if not (
-                name.startswith("_shared_experts.")
-                or name.startswith("_gate.")
-                or name.startswith("_routed_input_transform.")
-                or name.startswith("_routed_output_transform.")
-            )
+            if not name.startswith(NON_EXPERT_PREFIXES)
             and name not in NON_EXPERT_WEIGHTS
         )
 
@@ -1536,12 +1260,7 @@ class FusedMoE(PluggableLayer):
             for name, weight in weights
             if name not in NON_EXPERT_WEIGHTS
             and weight.shape != torch.Size([])
-            and not name.startswith("_shared_experts.")
-            # exclude parameters from non-expert submodules,
-            # e.g. gate/shared/transforms.
-            and not name.startswith("_gate.")
-            and not name.startswith("_routed_input_transform.")
-            and not name.startswith("_routed_output_transform.")
+            and not name.startswith(NON_EXPERT_PREFIXES)
         ]
 
     def set_eplb_state(
@@ -1556,14 +1275,22 @@ class FusedMoE(PluggableLayer):
 
         This is used later in forward pass, where we get the expert mapping
         and record the load metrics in `expert_load_view`.
+
+        Args:
+            moe_layer_idx: Index of this MoE layer
+            expert_load_view: View into global expert load tracking tensor
+            logical_to_physical_map: Mapping from logical to physical expert IDs
+            logical_replica_count: Number of replicas for each logical expert
         """
-        self.eplb_state.expert_load_view = expert_load_view[moe_layer_idx]
-        self.eplb_state.logical_to_physical_map = logical_to_physical_map[moe_layer_idx]
-        self.eplb_state.logical_replica_count = logical_replica_count[moe_layer_idx]
+        if self.eplb_state is not None:
+            self.eplb_state.set_layer_state(
+                moe_layer_idx,
+                expert_load_view,
+                logical_to_physical_map,
+                logical_replica_count,
+            )
 
     def ensure_moe_quant_config_init(self):
-        if not self.is_gpu_resident_layer:
-            return
         if self.quant_method.moe_quant_config is None:
             # Note: the moe_quant_config can't be constructed until after
             # weight loading post processing.
@@ -1659,509 +1386,6 @@ class FusedMoE(PluggableLayer):
         )
 
         return s
-    
-   
-    def get_max_num_group_batch_size(self) -> int:
-        max_num_batched_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
-        
-        if is_lk_moe_use_gpu_prefill():
-            group_batch_size = min(max_num_batched_tokens, get_gpu_prefill_min_batch_size()) + 128
-        else:
-            group_batch_size = min(4096, max_num_batched_tokens) + 128
-         
-        return group_batch_size
-    
-    def global_to_local_expert_ids(self, topk_ids): 
-        expert_map = self._expert_map.to(topk_ids.device)
-        max_idx = len(self._expert_map) - 1
-         
-        clamped = torch.clamp(topk_ids, 0, max_idx)
-        result = expert_map[clamped]
-         
-        mask = topk_ids < 0
-        result[mask] = -1
-        
-        return result
-    
-    def should_use_gpu_prefill(self, hidden_states: torch.Tensor) -> bool:
-        from vllm.forward_context import (
-            ForwardContext,
-            get_forward_context,
-            is_forward_context_available,
-        )
-        from vllm.config import CUDAGraphMode
-        forward_context = get_forward_context()
-        if (hasattr(forward_context, 'cudagraph_runtime_mode') and 
-            forward_context.cudagraph_runtime_mode != CUDAGraphMode.NONE):
-            return False
-        if torch.cuda.is_current_stream_capturing():
-            return False
-        return self.is_gpu_prefill_layer and hidden_states.size(0) >= get_gpu_prefill_min_batch_size()     
-    
-    def _zero_tensor(self, tensor: torch.Tensor):
-        if tensor is not None:
-            tensor.data = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
-            
-    def process_weights_after_loading(self):
-        if self.is_gpu_resident_layer:
-            logger.info(f"Initialized lk_moe with {self.local_num_experts} experts for layer {self.layer_name} [" + 
-            ("CPU" if not self.is_gpu_resident_layer else "GPU") + "]")
-            return
-
-        torch.cuda.synchronize()
-        try:
-            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16_marlin import CompressedTensorsWNA16MarlinMoEMethod
-            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import CompressedTensorsWNA16MoEMethod 
-            from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinMoEMethod
-            from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
-            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8 import CompressedTensorsW8A8Fp8MoEMethod
-            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import CompressedTensorsW4A4Nvfp4MoEMethod
-            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import CompressedTensorsW4A4Mxfp4MoEMethod
-            find_weight = False  
-            with torch.no_grad():
-                if (isinstance(self.quant_method, CompressedTensorsWNA16MarlinMoEMethod) or isinstance(self.quant_method, CompressedTensorsWNA16MoEMethod)):
-    
-                    self._process_wna16(self.quant_method.strategy)
-                    find_weight = True 
-                    
-                if isinstance(self.quant_method, AWQMarlinMoEMethod):
-                    self._process_awq()
-                    find_weight = True
-                    
-                if isinstance(self.quant_method, Fp8MoEMethod):
-                    self._process_fp8(self.quant_method.block_quant)
-                    find_weight = True
-                    
-                if isinstance(self.quant_method, CompressedTensorsW8A8Fp8MoEMethod):
-                    self._process_fp8(False)
-                    find_weight = True
-                    
-                if isinstance(self.quant_method, UnquantizedFusedMoEMethod): 
-                    self._process_bf6_fp16()
-                    find_weight = True
-                    
-                if isinstance(self.quant_method, CompressedTensorsW4A4Nvfp4MoEMethod):
-                    self._process_nvfp4()
-                    find_weight = True
-                    
-                if isinstance(self.quant_method, CompressedTensorsW4A4Mxfp4MoEMethod):
-                    self._process_mxfp4()
-                    find_weight = True
-                    
-                
-                if not find_weight: 
-                    logger.error("weight not found in layer, quant_method: %s", self.quant_method) 
-                    return
-                
-                self._initialize_cuda_graph_buffers()
-                logger.info(f"Initialized lk_moe with {self.local_num_experts} experts for layer {self.layer_name} [" + 
-                ("CPU" if not self.is_gpu_resident_layer else "GPU") + "]")
-        except Exception as e:
-            logger.error(f"Failed to initialize lk_moe: {e}") 
-            self.lk_moe = None
-            self.lk_moe_config = None
-            
-    def clean_weights_after_loading(self): 
-        if self.is_gpu_resident_layer:
-            return
-        weights = ["w13_weight", "w2_weight", 
-                "w13_weight_packed", "w2_weight_packed", 
-                "w13_weight_scale", "w2_weight_scale", 
-                "w13_weight_scale_inv", "w2_weight_scale_inv",
-                "w13_weight_global_scale", "w2_weight_global_scale"]
-        for weight in weights:
-            if hasattr(self, weight):
-                delattr(self, weight)
-                 
-    
-    def _get_processes_info(self) -> tuple[int, int, int]: 
-        if self.use_ep:
-            return self.ep_size, self.ep_rank, torch.cuda.current_device()
-        return self.tp_size, self.tp_rank, torch.cuda.current_device()
-    
-    def _get_quant_params(self, w13_weight, w13_weight_scale, pack_ratio):
-        unpack_factor = 1 if pack_ratio == 1 else 2  # FP8=1, 4bit=2
-        
-        groupN = w13_weight.shape[1] // w13_weight_scale.shape[1]
-        groupK = (w13_weight.shape[2] * unpack_factor) // w13_weight_scale.shape[2]
-        return groupN, groupK
-                   
-     
-    def _process_wna16(self, strategy: str): 
-        
-        is_transposed = self.quant_method.kernel_backend  != "Flashinfer"
-         
-        if(is_transposed):
-            w13_weight = self.w13_weight_packed.cpu().transpose(1, 2).contiguous().view(torch.uint8) 
-            w2_weight = self.w2_weight_packed.cpu().transpose(1, 2).contiguous().view(torch.uint8) 
-            w13_scale = self.w13_weight_scale.cpu().transpose(1, 2).contiguous()
-            w2_scale = self.w2_weight_scale.cpu().transpose(1, 2).contiguous() 
-        else:
-            w13_weight = self.w13_weight_packed.cpu().contiguous().view(torch.uint8) 
-            w2_weight = self.w2_weight_packed.cpu().contiguous().view(torch.uint8) 
-            w13_scale = self.w13_weight_scale.cpu().contiguous()
-            w2_scale = self.w2_weight_scale.cpu().contiguous() 
-    
-        
-        group_size = self.quant_method.group_size        # 32
-        num_bits = self.quant_method.num_bits            # 4
-        packed_factor = self.quant_method.packed_factor  # 8 （bit)
-         
- 
-        weights_per_container = packed_factor // num_bits  # 2 
-        
-        groupN, groupK = self._get_quant_params(w13_weight, w13_scale, weights_per_container)
-        
-        w13_weight_ptr = w13_weight.data_ptr()
-        w2_weight_ptr = w2_weight.data_ptr()
-       
-        w13_weight_scale_ptr = w13_scale.data_ptr()
-        w2_weight_scale_ptr = w2_scale.data_ptr()
-        
-        num_processes, process_id, gpu_id = self._get_processes_info()
-        
-        # V2: MOEConfigV2 + MOE_WNA16
-        self.lk_moe_config = lk_moe.MOEConfigV2()
-        self.lk_moe_config.num_processes = num_processes
-        self.lk_moe_config.process_id = process_id
-        self.lk_moe_config.gpu_id = gpu_id
-        self.lk_moe_config.has_gate_proj = self.has_gate_proj
-        self.lk_moe_config.expert_num = self.local_num_experts
-        self.lk_moe_config.top_k = self.top_k
-        self.lk_moe_config.hidden_size = self.hidden_size
-        self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
-        self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
-        self.lk_moe_config.stride = 32
-        self.lk_moe_config.group_min_len = 10
-        self.lk_moe_config.group_max_len = self.max_num_group_batch_size
-        self.lk_moe_config.groupN = groupN
-        self.lk_moe_config.groupK = groupK
-
-        # no global scale
-        self.lk_moe = lk_moe.MOE_WNA16(
-            self.lk_moe_config,
-            w13_weight_ptr,
-            w2_weight_ptr,
-            w13_weight_scale_ptr,
-            w2_weight_scale_ptr,
-            0,
-            0,
-        )
-         
-            
-    
-    
-    def _process_awq(self): 
-        
-        w13_qweight = self.w13_qweight
-        w2_qweight = self.w2_qweight
-        w13_scales = self.w13_scales
-        w2_scales = self.w2_scales
-        w13_qzeros = self.w13_qzeros
-        w2_qzeros = self.w2_qzeros
-        raise ValueError("AWQ Weights are not supported for lk moe ...") 
-         
- 
-    def _process_fp8(self, block_quant: bool):
-        w13_weight = self.w13_weight
-        w2_weight = self.w2_weight
-
-       
-        if block_quant:
-            w13_weight_scale = self.w13_weight_scale_inv
-            w2_weight_scale = self.w2_weight_scale_inv
-        else: 
-            w13_weight_scale = self.w13_weight_scale
-            w2_weight_scale = self.w2_weight_scale
-        
-        
-        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, 1)
-
-        w13_weight_ptr = w13_weight.contiguous().data_ptr()
-        w2_weight_ptr = w2_weight.contiguous().data_ptr()
-        w13_weight_scale_ptr = w13_weight_scale.contiguous().data_ptr()
-        w2_weight_scale_ptr = w2_weight_scale.contiguous().data_ptr()
-
-        num_processes, process_id, gpu_id = self._get_processes_info()
-
-        # V2: MOEConfigV2 + MOE_FP8
-        self.lk_moe_config = lk_moe.MOEConfigV2()
-        self.lk_moe_config.num_processes = num_processes
-        self.lk_moe_config.process_id = process_id
-        self.lk_moe_config.gpu_id = gpu_id
-        self.lk_moe_config.has_gate_proj = self.has_gate_proj
-        self.lk_moe_config.expert_num = self.local_num_experts
-        self.lk_moe_config.top_k = self.top_k
-        self.lk_moe_config.hidden_size = self.hidden_size
-        self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
-        self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
-        self.lk_moe_config.stride = 32
-        self.lk_moe_config.group_min_len = 10
-        self.lk_moe_config.group_max_len = self.max_num_group_batch_size
-        self.lk_moe_config.groupN = groupN
-        self.lk_moe_config.groupK = groupK
-
-        # no global scale
-        self.lk_moe = lk_moe.MOE_FP8(
-            self.lk_moe_config,
-            w13_weight_ptr,
-            w2_weight_ptr,
-            w13_weight_scale_ptr,
-            w2_weight_scale_ptr,
-            0,
-            0,
-        )
-            
-    def _process_bf6_fp16(self):
-        w13_weight = self.w13_weight
-        w2_weight = self.w2_weight
-         
-        w13_ptr = w13_weight.contiguous().data_ptr()
-        w2_ptr = w2_weight.contiguous().data_ptr()
-        
-        num_processes, process_id, gpu_id = self._get_processes_info()
-        
-        self.lk_moe_config = lk_moe.MOEConfigV2()
-        self.lk_moe_config.num_processes = num_processes
-        self.lk_moe_config.process_id = process_id
-        self.lk_moe_config.gpu_id = gpu_id
-        self.lk_moe_config.has_gate_proj = self.has_gate_proj
-        self.lk_moe_config.expert_num = self.local_num_experts
-        self.lk_moe_config.top_k = self.top_k
-        self.lk_moe_config.hidden_size = self.hidden_size
-        self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
-        self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
-        self.lk_moe_config.stride = 32
-        self.lk_moe_config.group_min_len = 10
-        self.lk_moe_config.group_max_len = self.max_num_group_batch_size
-        
-        # no scale
-        self.lk_moe = lk_moe.MOE_BF16(
-            self.lk_moe_config,
-            w13_ptr,
-            w2_ptr,
-             0,
-             0,
-             0,
-             0,
-        )
-        
-        
-    
-    def _process_nvfp4(self):  
-        
-        w13_weight = self.w13_weight_packed
-        w2_weight = self.w2_weight_packed
-         
-        w13_weight_scale = self.w13_weight_scale
-        w2_weight_scale = self.w2_weight_scale
-        w13_weight_global_scale = self.w13_weight_global_scale
-        w2_weight_global_scale = self.w2_weight_global_scale
-         
-         
-        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, 2)
-        
-        w13_weight_global_scale = 1.0 / w13_weight_global_scale
-        w2_weight_global_scale = 1.0 / w2_weight_global_scale
-         
-        w13_weight_ptr = w13_weight.contiguous().data_ptr()
-        w2_weight_ptr = w2_weight.contiguous().data_ptr()
-        w13_weight_scale_ptr = w13_weight_scale.contiguous().data_ptr()
-        w2_weight_scale_ptr = w2_weight_scale.contiguous().data_ptr()
-        w13_weight_global_scale_ptr = w13_weight_global_scale.contiguous().data_ptr()
-        w2_weight_global_scale_ptr = w2_weight_global_scale.contiguous().data_ptr()
-        
-        num_processes, process_id, gpu_id = self._get_processes_info()
-         
-        self.lk_moe_config = lk_moe.MOEConfigV2()
-        self.lk_moe_config.num_processes = num_processes
-        self.lk_moe_config.process_id = process_id
-        self.lk_moe_config.gpu_id = gpu_id
-        self.lk_moe_config.has_gate_proj = self.has_gate_proj
-        self.lk_moe_config.expert_num = self.local_num_experts
-        self.lk_moe_config.top_k = self.top_k
-        self.lk_moe_config.hidden_size = self.hidden_size
-        self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
-        self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
-        self.lk_moe_config.stride = 32
-        self.lk_moe_config.group_min_len = 10
-        self.lk_moe_config.group_max_len = self.max_num_group_batch_size
-        self.lk_moe_config.groupN = groupN
-        self.lk_moe_config.groupK = groupK
-         
-        self.lk_moe = lk_moe.MOE_NVFP4(
-            self.lk_moe_config,
-            w13_weight_ptr,
-            w2_weight_ptr,
-            w13_weight_scale_ptr,
-            w2_weight_scale_ptr,
-            w13_weight_global_scale_ptr,
-            w2_weight_global_scale_ptr,
-        )
-        
- 
-    
-    def _process_mxfp4(self):
-        w13_weight = self.w13_weight
-        w2_weight = self.w2_weight 
-        w13_weight_scale = self.w13_weight_scale
-        w2_weight_scale = self.w2_weight_scale 
-         
-        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, 2)
-
-        w13_weight_ptr = w13_weight.contiguous().data_ptr()
-        w2_weight_ptr = w2_weight.contiguous().data_ptr()
-        w13_weight_scale_ptr = w13_weight_scale.contiguous().data_ptr()
-        w2_weight_scale_ptr = w2_weight_scale.contiguous().data_ptr()
-
-        num_processes, process_id, gpu_id = self._get_processes_info()
-
-        # V2: MOEConfigV2 + MOE_MXFP4
-        self.lk_moe_config = lk_moe.MOEConfigV2()
-        self.lk_moe_config.num_processes = num_processes
-        self.lk_moe_config.process_id = process_id
-        self.lk_moe_config.gpu_id = gpu_id
-        self.lk_moe_config.has_gate_proj = self.has_gate_proj
-        self.lk_moe_config.expert_num = self.local_num_experts
-        self.lk_moe_config.top_k = self.top_k
-        self.lk_moe_config.hidden_size = self.hidden_size
-        self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
-        self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
-        self.lk_moe_config.stride = 32
-        self.lk_moe_config.group_min_len = 10
-        self.lk_moe_config.group_max_len = self.max_num_group_batch_size
-        self.lk_moe_config.groupN = groupN
-        self.lk_moe_config.groupK = groupK
-
-        # no global scale
-        self.lk_moe = lk_moe.MOE_MXFP4(
-            self.lk_moe_config,
-            w13_weight_ptr,
-            w2_weight_ptr,
-            w13_weight_scale_ptr,
-            w2_weight_scale_ptr,
-            0,
-            0,
-        )
-         
-         
-         
-    def _get_max_num_seqs(self) -> int:
-        if self.vllm_config.speculative_config is not None and self.vllm_config.speculative_config.num_speculative_tokens > 0:
-            batch_size = self.vllm_config.scheduler_config.max_num_seqs * (
-                1 + self.vllm_config.speculative_config.num_speculative_tokens
-            ) * 2
-        else:
-            batch_size = self.vllm_config.scheduler_config.max_num_seqs * 2
-
-        batch_size = min(batch_size, 512)
-        
-        return batch_size
-         
-    def _initialize_cuda_graph_buffers(self): 
-        if not hasattr(FusedMoE, 'cuda_graphs'):
-            max_batch_size = self._get_max_num_seqs()
-            FusedMoE.cuda_graphs = [1, 2, 4] + list(range(8, max_batch_size + 1, 8))
-            
-            current_device = torch.cuda.current_device()
-             
-            FusedMoE.output_gpu = torch.zeros(
-                (max_batch_size, self.hidden_size),
-                device=current_device,
-                dtype=torch.float32,
-                requires_grad=False
-            ).contiguous()
-         
-    def _find_best_graph_index(self, total_tokens: int) -> int:
-        if not hasattr(FusedMoE, 'cuda_graphs') or not FusedMoE.cuda_graphs:
-            raise ValueError("No CUDA graphs initialized.")
-        
-        cuda_graphs = FusedMoE.cuda_graphs
-        
-        low, high = 0, len(cuda_graphs) - 1
-        best_index = len(cuda_graphs) - 1  
-        
-        while low <= high:
-            mid = (low + high) // 2
-            if cuda_graphs[mid] >= total_tokens:
-                best_index = mid
-                high = mid - 1
-            else:
-                low = mid + 1
-         
-        if best_index >= len(cuda_graphs):
-            best_index = len(cuda_graphs) - 1
-             
-        if cuda_graphs[best_index] < total_tokens:
-            raise ValueError(f"No suitable CUDA graph found for {total_tokens} tokens. "
-                            f"Maximum available buffer size: {cuda_graphs[-1]}")
-        
-        return best_index
-     
-        
-    def _cpu_decode(self, hidden_states, topk_weights, topk_ids):
-        stream_ptr = torch.cuda.current_stream().cuda_stream
-        self.lk_moe.cpu_decode(
-            stream_ptr,
-            hidden_states.size(0),
-            self.top_k,
-            hidden_states.data_ptr(),
-            topk_ids.data_ptr(),
-            topk_weights.data_ptr(),
-            FusedMoE.output_gpu.data_ptr()
-        )
-        
-        output = FusedMoE.output_gpu[:hidden_states.size(0)]
-        if self.check_nan_in_output:
-            torch.nan_to_num(output, nan=0.0, out=output)
-        return output.to(hidden_states.dtype)
- 
-
-    def _cpu_prefill(self, hidden_states, topk_weights, topk_ids): 
-         
-        expert_ids_cpu = topk_ids.to(dtype=torch.int32, device='cpu', non_blocking=True)
-        weights_cpu = topk_weights.to(dtype=torch.float32, device='cpu', non_blocking=True)
-        hidden_states_cpu = hidden_states.to(device='cpu', non_blocking=True)
-        output_cpu = torch.empty_like(hidden_states, dtype=torch.float32, device='cpu') 
-        
-        current_stream = torch.cuda.current_stream()
-        current_stream.synchronize()
-        
-        self.lk_moe.cpu_prefill(
-            hidden_states.size(0),
-            expert_ids_cpu.size(1),
-            expert_ids_cpu.data_ptr(),
-            weights_cpu.data_ptr(),
-            hidden_states_cpu.data_ptr(),
-            output_cpu.data_ptr(),
-        )
-             
-        output_gpu = output_cpu.to(torch.cuda.current_device(), dtype=hidden_states.dtype, non_blocking=True) 
-        
-        if self.check_nan_in_output:
-            torch.nan_to_num(output_gpu, nan=0.0, out=output_gpu)
-        
-        return output_gpu
-
-    def _gpu_prefill(self, hidden_states, topk_weights, topk_ids):
-        current_stream = torch.cuda.current_stream()
-        output = torch.empty_like(hidden_states) 
-        self.lk_moe.gpu_prefill(
-            hidden_states.data_ptr(),
-            output.data_ptr(),
-            topk_ids.data_ptr(),
-            topk_weights.data_ptr(),
-            hidden_states.size(0),
-            topk_ids.size(1),
-            torch.cuda.current_stream().cuda_stream,
-        ) 
-        return output
-
 
 
 # This is a temporary forwarding method which will be removed/modified layer.

@@ -12,8 +12,9 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
     FusedMoeWeightScaleSupported,
+    RoutedExperts,
+    SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -119,9 +120,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        device = torch.cuda.current_device() if current_platform.is_cuda_alike() else "cpu"
-        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
-            device = "cpu"
         layer.num_experts = num_experts
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
@@ -162,7 +160,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 w13_num_shards * intermediate_size_per_partition,
                 hidden_size,
                 dtype=params_dtype,
-                device=device,
             ),
             requires_grad=False,
         )
@@ -175,7 +172,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 hidden_size,
                 intermediate_size_per_partition,
                 dtype=params_dtype,
-                device=device,
             ),
             requires_grad=False,
         )
@@ -188,15 +184,15 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             # They will be combined to a single scale after weight loading.
             # For non-gated MoE, allocate 1 scale for w13.
             w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, w13_num_shards, dtype=torch.float32, device=device),
+                torch.ones(num_experts, w13_num_shards, dtype=torch.float32),
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             w2_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32, device=device), requires_grad=False
+                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
             )
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
-            # Add PER-TENSOR quantization for FusedMoE.weight_loader.
+            # Add PER-TENSOR quantization for RoutedExperts.weight_loader.
             extra_weight_attrs.update(
                 {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
             )
@@ -210,17 +206,16 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                     w13_num_shards * intermediate_size_per_partition,
                     1,
                     dtype=torch.float32,
-                    device=device,
                 ),
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             w2_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, hidden_size, 1, dtype=torch.float32, device=device),
+                torch.ones(num_experts, hidden_size, 1, dtype=torch.float32),
                 requires_grad=False,
             )
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
-            # Add PER-CHANNEL quantization for FusedMoE.weight_loader.
+            # Add PER-CHANNEL quantization for RoutedExperts.weight_loader.
             extra_weight_attrs.update(
                 {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
             )
@@ -235,7 +230,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                     * ((intermediate_size_per_partition + block_n - 1) // block_n),
                     (hidden_size + block_k - 1) // block_k,
                     dtype=torch.float32,
-                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -246,12 +240,11 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                     (hidden_size + block_n - 1) // block_n,
                     (intermediate_size_per_partition + block_k - 1) // block_k,
                     dtype=torch.float32,
-                    device=device,
                 ),
                 requires_grad=False,
             )
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
-            # Add PER-CHANNEL quantization for FusedMoE.weight_loader.
+            # Add PER-CHANNEL quantization for RoutedExperts.weight_loader.
             extra_weight_attrs.update(
                 {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
             )
@@ -275,9 +268,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
-    def process_weights_after_loading(self, layer: FusedMoE) -> None:
-        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
-            return
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         # Allow for accessing weights and scales in standard way.
         w13 = layer.w13_weight
         w2 = layer.w2_weight
@@ -346,19 +337,17 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 moe_config=self.moe,
                 fp8_backend=self.fp8_backend,
                 experts_cls=self.experts_cls,
-                routing_tables=layer._maybe_init_expert_routing_tables(),
-                shared_experts=layer.shared_experts,
+                routing_tables=layer._expert_routing_tables(),
             )
 
     def maybe_make_prepare_finalize(
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> mk.FusedMoEPrepareAndFinalizeModular | None:
-        # raise ValueError(
-        #     f"{self.__class__.__name__} uses the new modular kernel initialization "
-        #     "logic. This function should not be called."
-        # )
-        pass
+        raise ValueError(
+            f"{self.__class__.__name__} uses the new modular kernel initialization "
+            "logic. This function should not be called."
+        )
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
         is_per_token = self.input_quant.strategy == QuantizationStrategy.TOKEN
@@ -371,11 +360,12 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             per_act_token_quant=is_per_token,
             per_out_ch_quant=is_per_token,
             block_shape=self.weight_block_size,
+            swiglu_limit=getattr(layer, "swiglu_limit", None),
         )
 
     def apply_monolithic(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
@@ -398,10 +388,11 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
     def apply(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
@@ -418,6 +409,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             # https://github.com/vllm-project/vllm/commit/84166fee9770e6fba71a96978b3e7d149392fb28 # noqa: E501
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
 

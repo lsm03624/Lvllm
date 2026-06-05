@@ -169,6 +169,7 @@ def _get_cpu_binding(parallel_config, gpu_index: int) -> str | None:
 
     return cpu_bindings[gpu_index]
 
+
 def _get_numactl_args(
     vllm_config: "VllmConfig",
     local_rank: int,
@@ -179,13 +180,6 @@ def _get_numactl_args(
     if not parallel_config.numa_bind:
         return None
 
-    from vllm.envs import is_lk_moe_feature_enabled, is_numa_interleave_enabled
- 
-    if is_lk_moe_feature_enabled():
-        if is_numa_interleave_enabled():
-            return "--interleave=all"
-        return None
- 
     gpu_index = _get_gpu_index(parallel_config, local_rank, dp_local_rank)
     numa_node = _get_numa_node(parallel_config, gpu_index)
     cpu_binding = _get_cpu_binding(parallel_config, gpu_index)
