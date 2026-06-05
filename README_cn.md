@@ -95,7 +95,7 @@ vLLM已验证的大部分原版MOE模型
 | awq 4bit对称量化模型 <sup>注1</sup>| w4a16 | 
 
 注1：https://hf-mirror.com/cyankiwi 提供AWQ 4bit对称量化模型
-注2：deepseek v4 需使用专用版本：pip install Lvllm-DS4
+注2：deepseek v4 需使用专用版本：pip install LvllmDS4
 
  
 
