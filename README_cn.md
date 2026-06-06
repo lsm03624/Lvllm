@@ -114,7 +114,7 @@ LVLLM_GPU_RESIDENT_MOE_LAYERS=0-1,33-34 \
 LVLLM_GPU_RESIDENT_MOE_EXPERTS=64 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD=1 \
-Lvllm serve \
+vllm serve \
     --model /home/guqiong/Models/Qwen3.6-35B-A3B \
     --host 0.0.0.0 \
     --port 8070 \
