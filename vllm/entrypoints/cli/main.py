@@ -75,7 +75,7 @@ def main():
             "-v",
             "--version",
             action="version",
-            version=importlib.metadata.version("vllm"),
+            version=importlib.metadata.version("lvllm"),
         )
         subparsers = parser.add_subparsers(required=False, dest="subparser")
         cmds = {}
