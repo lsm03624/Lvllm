@@ -91,7 +91,8 @@ Unlisted original MOE models from Qwen3, GLM, and MiniMax series are theoretical
 | awq 4bit symmetric quantization model <sup>Note 1</sup> | w4a16 |
 
 Note 1: AWQ 4bit symmetric quantization models are available at https://hf-mirror.com/cyankiwi
-Note 2: deepseek v4 requires a dedicated version: pip install LvllmDS4
+Note 2: deepseek v4 requires a dedicated version:
+ pip install https://github.com/guqiong96/Lvllm/releases/download/Lvllm-v2.2.0/lvllmds4-2.2.0-cp312-cp312-manylinux_2_34_x86_64.whl
 
 ## Run Command Reference
 
