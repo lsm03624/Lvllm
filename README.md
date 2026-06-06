@@ -191,7 +191,7 @@ pip install torchaudio triton torchvision torch==2.11.0
 ### 4. Install LvLLM
 
 ```bash
-pip install Lvllm==2.2.0
+pip install https://github.com/guqiong96/Lvllm/releases/download/Lvllm-v2.2.0/lvllm-2.2.0-cp312-cp312-manylinux_2_34_x86_64.whl
 ```
 
 ## Compile and Install Lvllm
