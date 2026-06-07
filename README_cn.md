@@ -215,7 +215,7 @@ pip install https://github.com/guqiong96/Lvllm/releases/download/Lvllm-v2.2.0/lv
 ```bash 
 git clone https://github.com/guqiong96/Lvllm.git
 cd Lvllm
-VLLM_VERSION_OVERRIDE="2.2.0" CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e . --no-build-isolation -vvv
+VLLM_VERSION_OVERRIDE="2.2.1" CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e . --no-build-isolation -vvv
 ```
  
 ## 优化

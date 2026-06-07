@@ -1476,6 +1476,7 @@ class FusedMoE(PluggableLayer):
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import CompressedTensorsW4A4Nvfp4MoEMethod
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import CompressedTensorsW4A4Mxfp4MoEMethod
             from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
+            from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
             find_weight = False  
             with torch.no_grad():
                 if (isinstance(self.quant_method, CompressedTensorsWNA16MarlinMoEMethod) or isinstance(self.quant_method, CompressedTensorsWNA16MoEMethod)):
@@ -1503,7 +1504,7 @@ class FusedMoE(PluggableLayer):
                     self._process_nvfp4()
                     find_weight = True
                     
-                if isinstance(self.quant_method, CompressedTensorsW4A4Mxfp4MoEMethod):
+                if isinstance(self.quant_method, CompressedTensorsW4A4Mxfp4MoEMethod) or isinstance(self.quant_method, Mxfp4MoEMethod):
                     self._process_mxfp4()
                     find_weight = True
                     
