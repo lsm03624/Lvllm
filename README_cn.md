@@ -113,7 +113,7 @@ LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_RESIDENT_MOE_LAYERS=0-1,33-34 \
 LVLLM_GPU_RESIDENT_MOE_EXPERTS=64 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
-LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD=1 \
+LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1 \
 vllm serve \
     --model /home/guqiong/Models/Qwen3.6-35B-A3B \
     --host 0.0.0.0 \
@@ -184,7 +184,7 @@ sudo sh cuda_13.2.1_595.58.03_linux.run
 ```bash
 conda create -n Lvllm python==3.12.11
 conda activate Lvllm
-pip install setuptools_scm setuptools_rust
+
 
 # 升级libstdcxx-ng（避免glibcxx版本问题）
 conda install -c conda-forge libstdcxx-ng

@@ -17,7 +17,6 @@ mkdir -p $TMPDIR
 
 rm -f dist/lvllm-${VLLM_VERSION_OVERRIDE}-cp312-cp312-linux_x86_64.whl
 rm -f dist/lvllm-${VLLM_VERSION_OVERRIDE}-cp312-cp312-manylinux_2_34_x86_64.whl
-rm -f dist/lvllm-${VLLM_VERSION_OVERRIDE}-cp312-cp312-manylinux_2_34_x86_64_stripped.whl
 
 VLLM_VERSION_OVERRIDE="$VLLM_VERSION_OVERRIDE" pip install -e . --no-build-isolation -vvv
 VLLM_VERSION_OVERRIDE="$VLLM_VERSION_OVERRIDE" pip wheel . --no-build-isolation -v --wheel-dir=dist
@@ -36,21 +35,9 @@ auditwheel repair "$ORIGINAL_WHL" -w dist/ \
   --exclude libcupti.so.13 --exclude libcufile.so.0 --exclude libgomp.so.1 --exclude libshm.so
 
 REPAIRED_FILE=$(ls dist/lvllm-${VLLM_VERSION_OVERRIDE}-cp312-cp312-manylinux_2_34_x86_64.whl | head -1)
-FINAL_WHL="dist/lvllm-${VLLM_VERSION_OVERRIDE}-cp312-cp312-manylinux_2_34_x86_64_stripped.whl"
-
-TMP_DIR=$(mktemp -d)
-cd "$TMP_DIR"
-unzip -q "$PROJECT_DIR/$REPAIRED_FILE"
-rm -rf lvllm.libs/
-grep -v "lvllm.libs/" lvllm-*.dist-info/RECORD > RECORD.tmp
-mv RECORD.tmp lvllm-*.dist-info/RECORD
-zip -qr "$PROJECT_DIR/$FINAL_WHL" .
-rm -rf "$TMP_DIR"
-rm -f "$PROJECT_DIR/$REPAIRED_FILE"
-cd "$PROJECT_DIR"
-
 FINAL_NAME="dist/lvllm-${VLLM_VERSION_OVERRIDE}-cp312-cp312-manylinux_2_34_x86_64.whl"
-mv "$FINAL_WHL" "$FINAL_NAME"
+
+mv "$REPAIRED_FILE" "$FINAL_NAME"
 
 echo ""
 echo "Wheel: $(ls -lh $FINAL_NAME | awk '{print $5}')"
